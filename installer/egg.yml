@@ -20,7 +20,7 @@ docker_images:
   'Java 21': 'ghcr.io/pelican-eggs/yolks:java_21'
 file_denylist: {  }
 startup_commands:
-  Default: 'java -Xms6G -XX:MaxRAMPercentage=95.0 -Dterminal.jline=false -Dterminal.ansi=true -Dfml.readTimeout=300 @java9args.txt -jar Crucible-server.jar nogui'
+  Default: './setup.sh && java -Xms6G -XX:MaxRAMPercentage=95.0 -Dterminal.jline=false -Dterminal.ansi=true -Dfml.readTimeout=300 @java9args.txt -jar Crucible-server.jar nogui'
 config:
   files:
     server.properties:
@@ -73,3 +73,14 @@ variables:
       - nullable
       - string
     sort: 3
+  -
+    name: 'Server Directory'
+    description: 'Where setup.sh writes the server tree relative to the persistent volume. The egg expects the Crucible jar at the volume root, so this must be ".". Hidden from the user.'
+    env_variable: SERVER_DIR
+    default_value: '.'
+    user_viewable: false
+    user_editable: false
+    rules:
+      - required
+      - string
+    sort: 4

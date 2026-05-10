@@ -6,14 +6,26 @@
 # install.sh — idempotently set up a GTNewHorizons (1.7.10 Forge) server with
 # Crucible (Bukkit/Forge hybrid for plugin support).
 #
-# Re-running with unchanged variables is a no-op. The script re-installs only
-# on first run, when the previous run failed, or when any of the input
-# variables below have changed since the last successful run. Large downloads
-# are cached so re-installs don't refetch them. World saves and runtime data
-# under SERVER_DIR are preserved across re-installs.
+# On every invocation this script (a) refreshes the per-server configuration
+# overlay from the config git repo, and (b) re-runs the heavy install
+# (download/extract/scrub) only when any of the fingerprinted input variables
+# below have changed since the last successful run. Worlds and runtime data
+# under SERVER_DIR are preserved across re-installs. Large downloads are
+# cached so re-installs don't refetch them.
+#
+# Heavy install requires curl + unzip; the runtime yolk image lacks them, so
+# a fingerprint mismatch on a normal boot causes setup.sh to exit non-zero
+# (preventing the server from starting). Resolve via panel Reinstall — version
+# bumps and config-baseline review tend to land together anyway.
 
 set -Eeuo pipefail
 cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+
+# Bash 5.2 introduced patsub_replacement, which makes "&" in the replacement
+# string of ${var//pat/repl} mean "the matched text" (sed-style). Disable it
+# so render_template can substitute values containing "&" literally without
+# escaping. Silently ignored on bash <5.2 where the option doesn't exist.
+shopt -u patsub_replacement 2>/dev/null || true
 
 # ============================================================================
 # Inputs — edit these to configure the install
@@ -33,11 +45,13 @@ GTNH_JAVA_VARIANT="java17_2XUrl"
 CRUCIBLE_TAG="${CRUCIBLE_TAG:-latest}"
 
 # Server codename. Also used as the branch name in the configuration git repo.
+# Changing this on a running server will pull the new branch on next boot
+# without triggering a heavy reinstall.
 SERVER_CODENAME="${SERVER_CODENAME:-testing}"
 
 # Git repository containing per-server configuration (plugins/, server.properties,
-# etc). The branch named SERVER_CODENAME is checked out and rsync'ed over the
-# server install — files in the repo win.
+# etc). The branch named SERVER_CODENAME is checked out and overlaid on top
+# of the server install — files in the repo win.
 CONFIG_GIT_REPO="https://github.com/gregindustri/server-configs.git"
 
 # Where the playable server lives. World saves, logs, and crash-reports under
@@ -75,11 +89,12 @@ GTNH_FILES_TO_REMOVE=(
 	"updates.html"
 )
 
-# Paths to exclude when overlaying the config repo onto the server. Things in
-# the config repo that exist purely to support developers (READMEs, licenses,
-# example secrets, ignore files) and should never reach the server filetree.
-# Patterns follow rsync filter rules: a leading "/" anchors to the repo root,
-# otherwise the pattern matches at any depth.
+# Paths to delete from the config repo working tree before overlaying it onto
+# the server. Patterns starting with "/" are anchored at the repo root and
+# may include shell globs (e.g. "/LICENSE-*"). Other patterns match by
+# basename at any depth (e.g. "*.md" removes every Markdown file in the
+# tree). Trailing "/" is allowed but ignored — files and directories alike
+# are removed recursively.
 CONFIG_REPO_EXCLUDES=(
 	"*.md"
 	".gitignore"
@@ -92,7 +107,7 @@ CONFIG_REPO_EXCLUDES=(
 # Bump this when the install layout itself changes (e.g. directories scrubbed,
 # overlay order). Old installs will be considered stale even if user variables
 # haven't moved.
-SCRIPT_REVISION="1"
+SCRIPT_REVISION="2"
 
 # ============================================================================
 # Implementation
@@ -116,11 +131,174 @@ ensure_command() {
 	command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
 }
 
-for cmd in curl unzip jq git rsync sha256sum envsubst; do
+# ----------------------------------------------------------------------------
+# Render a *.template file to an output path. Substitutes $VAR / ${VAR}
+# references for variable names listed in $allowed_vars (whitespace-separated,
+# expected to be set in the caller). Uses bash parameter expansion for
+# literal string replacement — no regex, no shell evaluation. Only names in
+# $allowed_vars are substituted, so stray $PATH / $HOME-style strings in
+# templates are left alone.
+# ----------------------------------------------------------------------------
+
+render_template() {
+	local tmpl="$1" out="$2"
+	local content var value
+	# Read the whole template into a string. The trailing-x trick preserves
+	# any final newlines that command substitution would otherwise strip.
+	content="$(cat "$tmpl"; printf x)"
+	content="${content%x}"
+	for var in $allowed_vars; do
+		value="${!var:-}"
+		# Replace ${VAR} before $VAR so the brace form isn't double-substituted.
+		content="${content//\$\{$var\}/$value}"
+		content="${content//\$$var/$value}"
+	done
+	mkdir -p "$(dirname "$out")"
+	printf '%s' "$content" >"$out"
+}
+
+# ----------------------------------------------------------------------------
+# Sync the config git repo, render templates, prune developer-only paths, and
+# overlay the result onto $SERVER_DIR. Runs on every invocation, regardless
+# of whether the heavy install ran.
+# ----------------------------------------------------------------------------
+
+apply_config_overlay() {
+	log "Syncing config repo branch '$SERVER_CODENAME' from $CONFIG_GIT_REPO"
+	if [ -d "$CONFIG_REPO_DIR/.git" ]; then
+		git -C "$CONFIG_REPO_DIR" remote set-url origin "$CONFIG_GIT_REPO"
+		git -C "$CONFIG_REPO_DIR" fetch --depth=1 origin "$SERVER_CODENAME"
+		git -C "$CONFIG_REPO_DIR" reset --hard FETCH_HEAD
+		git -C "$CONFIG_REPO_DIR" clean -fdx
+	else
+		rm -rf "$CONFIG_REPO_DIR"
+		git clone --depth=1 --branch "$SERVER_CODENAME" "$CONFIG_GIT_REPO" "$CONFIG_REPO_DIR"
+	fi
+
+	# Find templates BEFORE pruning so they're still on disk to render.
+	local templates=()
+	local tmpl rel out
+	while IFS= read -r -d '' tmpl; do
+		templates+=("$tmpl")
+	done < <(find "$CONFIG_REPO_DIR" -type d -name '.git' -prune -o -type f -name '*.template' -print0)
+
+	if [ "${#templates[@]}" -gt 0 ]; then
+		[ -f "$SECRETS_ENV_FILE" ] ||
+			die "config repo contains *.template files but $SECRETS_ENV_FILE does not exist"
+
+		local allowed_vars
+		allowed_vars="$(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=.*/\2/p' "$SECRETS_ENV_FILE")"
+		[ -n "$allowed_vars" ] ||
+			die "$SECRETS_ENV_FILE contains no KEY=value entries — nothing to substitute"
+		# Iterate longest names first so that e.g. $RCON_PASSWORD wins over
+		# $RCON_PASS when both are present in the secrets file. (Edge case:
+		# a non-allowed variable whose name starts with an allowed one will
+		# still be partially substituted; templates using ${VAR} are safe.)
+		allowed_vars="$(printf '%s\n' $allowed_vars | awk '{ print length, $0 }' | sort -k1,1nr | awk '{print $2}')"
+
+		log "Rendering ${#templates[@]} template file(s) using $SECRETS_ENV_FILE"
+		(
+			set -a
+			# shellcheck source=/dev/null
+			. "$SECRETS_ENV_FILE"
+			set +a
+			for tmpl in "${templates[@]}"; do
+				rel="${tmpl#"$CONFIG_REPO_DIR/"}"
+				out="$SERVER_DIR/${rel%.template}"
+				render_template "$tmpl" "$out"
+				log "  rendered ${rel%.template}"
+			done
+		)
+	fi
+
+	log "Pruning excluded paths from the config repo working tree"
+	rm -rf "$CONFIG_REPO_DIR/.git"
+	find "$CONFIG_REPO_DIR" -type f -name '*.template' -delete
+	local pat rel match
+	for pat in "${CONFIG_REPO_EXCLUDES[@]}"; do
+		if [[ "$pat" == /* ]]; then
+			# Anchored at repo root. Allow shell globs in $rel.
+			rel="${pat#/}"
+			rel="${rel%/}"
+			shopt -s nullglob
+			# shellcheck disable=SC2206  # intentional glob expansion
+			local matches=( "$CONFIG_REPO_DIR/"$rel )
+			shopt -u nullglob
+			for match in "${matches[@]}"; do
+				rm -rf "$match"
+			done
+		else
+			# Any-depth basename match.
+			find "$CONFIG_REPO_DIR" -name "${pat%/}" -exec rm -rf {} +
+		fi
+	done
+
+	log "Overlaying configuration onto $SERVER_DIR"
+	cp -a "$CONFIG_REPO_DIR/." "$SERVER_DIR/"
+
+	# Make any shell scripts that came from the config repo executable.
+	find "$SERVER_DIR" -maxdepth 2 -type f -name '*.sh' -exec chmod +x {} +
+}
+
+# ----------------------------------------------------------------------------
+# Lightweight tools — required on every invocation, present in both the egg
+# installer image and the runtime yolk image.
+# ----------------------------------------------------------------------------
+
+for cmd in jq sha256sum awk sed git find cp; do
 	ensure_command "$cmd"
 done
 
-mkdir -p "$CACHE_DIR" "$SERVER_DIR"
+mkdir -p "$SERVER_DIR"
+
+# ----------------------------------------------------------------------------
+# Fingerprint the heavy-install inputs and decide whether to re-install.
+# Inputs that affect only the config overlay (SERVER_CODENAME, CONFIG_GIT_REPO,
+# SECRETS_ENV_FILE) are deliberately NOT fingerprinted — those changes apply
+# automatically on the next boot via apply_config_overlay.
+# ----------------------------------------------------------------------------
+
+FINGERPRINT="$(printf '%s\n' \
+	"rev=$SCRIPT_REVISION" \
+	"gtnh_version=$GTNH_VERSION" \
+	"gtnh_java_variant=$GTNH_JAVA_VARIANT" \
+	"crucible_tag=$CRUCIBLE_TAG" \
+	"server_dir=$SERVER_DIR" |
+	sha256sum | awk '{print $1}')"
+
+prior_fp=""
+prior_status=""
+if [ -f "$STATE_FILE" ]; then
+	prior_fp="$(jq -r '.fingerprint // empty' "$STATE_FILE" 2>/dev/null || true)"
+	prior_status="$(jq -r '.status // empty' "$STATE_FILE" 2>/dev/null || true)"
+fi
+
+if [ "$prior_status" = "ok" ] && [ "$prior_fp" = "$FINGERPRINT" ]; then
+	log "Install is current (fingerprint $FINGERPRINT)"
+	apply_config_overlay
+	log "Configuration refreshed."
+	exit 0
+fi
+
+# Heavy install required (first install, recovery, or input change).
+if [ -z "$prior_fp" ]; then
+	log "Performing first-time install"
+else
+	log "Re-install required (status=${prior_status:-unset}, fingerprint changed)"
+fi
+
+# ----------------------------------------------------------------------------
+# Heavy install — only reached on first install, recovery, or input change.
+# Tools below are present in the egg installer image but NOT in the runtime
+# yolk image. A fingerprint mismatch on a normal yolk boot fails here, which
+# is the intended failure mode (panel Reinstall fixes it).
+# ----------------------------------------------------------------------------
+
+for cmd in curl unzip; do
+	ensure_command "$cmd"
+done
+
+mkdir -p "$CACHE_DIR"
 
 # ----------------------------------------------------------------------------
 # Resolve GTNH download URL
@@ -139,11 +317,27 @@ GTNH_URL="$(jq -r --arg v "$GTNH_VERSION" --arg k "$GTNH_JAVA_VARIANT" \
 
 log "Resolving Crucible release"
 if [ "$CRUCIBLE_TAG" = "latest" ]; then
-	crucible_release_json="$(curl -fsSL "$CRUCIBLE_API/releases?per_page=20" |
-		jq '[.[] | select(.tag_name | startswith("staging-"))][0]')"
-	[ "$crucible_release_json" != "null" ] ||
+	# Find the newest staging release that ships both a *-server.jar and a
+	# libraries.zip. Crucible's CI has occasionally produced releases missing
+	# libraries.zip while their build process is in flux; fall back to the
+	# next-newest rather than hard-failing.
+	staging_releases="$(curl -fsSL "$CRUCIBLE_API/releases?per_page=20" |
+		jq '[.[] | select(.tag_name | startswith("staging-"))]')"
+	[ "$(jq 'length' <<<"$staging_releases")" -gt 0 ] ||
 		die "no staging Crucible release found"
+
+	newest_staging_tag="$(jq -r '.[0].tag_name' <<<"$staging_releases")"
+	crucible_release_json="$(jq '[.[] | select(
+			any(.assets[]; .name | endswith("-server.jar")) and
+			any(.assets[]; .name == "libraries.zip")
+		)][0]' <<<"$staging_releases")"
+	[ "$crucible_release_json" != "null" ] ||
+		die "no staging Crucible release with both -server.jar and libraries.zip in the last 20"
 	CRUCIBLE_TAG_RESOLVED="$(jq -r '.tag_name' <<<"$crucible_release_json")"
+
+	if [ "$CRUCIBLE_TAG_RESOLVED" != "$newest_staging_tag" ]; then
+		warn "Newest staging release $newest_staging_tag is missing libraries.zip; falling back to $CRUCIBLE_TAG_RESOLVED"
+	fi
 else
 	crucible_release_json="$(curl -fsSL "$CRUCIBLE_API/releases/tags/$CRUCIBLE_TAG")"
 	CRUCIBLE_TAG_RESOLVED="$CRUCIBLE_TAG"
@@ -157,38 +351,6 @@ CRUCIBLE_LIBS_URL="$(jq -r '[.assets[] | select(.name == "libraries.zip")][0].br
 [ -n "$CRUCIBLE_LIBS_URL" ] && [ "$CRUCIBLE_LIBS_URL" != "null" ] ||
 	die "Crucible release $CRUCIBLE_TAG_RESOLVED is missing libraries.zip"
 
-# ----------------------------------------------------------------------------
-# Fingerprint the inputs and decide whether to re-install
-# ----------------------------------------------------------------------------
-
-secrets_hash=""
-if [ -f "$SECRETS_ENV_FILE" ]; then
-	secrets_hash="$(sha256sum "$SECRETS_ENV_FILE" | awk '{print $1}')"
-fi
-
-FINGERPRINT="$(printf '%s\n' \
-	"rev=$SCRIPT_REVISION" \
-	"gtnh_version=$GTNH_VERSION" \
-	"gtnh_java_variant=$GTNH_JAVA_VARIANT" \
-	"crucible_tag=$CRUCIBLE_TAG" \
-	"server_codename=$SERVER_CODENAME" \
-	"config_git_repo=$CONFIG_GIT_REPO" \
-	"server_dir=$SERVER_DIR" \
-	"secrets_hash=$secrets_hash" |
-	sha256sum | awk '{print $1}')"
-
-if [ -f "$STATE_FILE" ]; then
-	prior_fp="$(jq -r '.fingerprint // empty' "$STATE_FILE" 2>/dev/null || true)"
-	prior_status="$(jq -r '.status // empty' "$STATE_FILE" 2>/dev/null || true)"
-	if [ "$prior_status" = "ok" ] && [ "$prior_fp" = "$FINGERPRINT" ]; then
-		log "Install is current (fingerprint $FINGERPRINT). Nothing to do."
-		exit 0
-	fi
-	log "Re-install required (status=${prior_status:-unset})"
-else
-	log "Performing first-time install"
-fi
-
 write_state() {
 	jq -n \
 		--arg fingerprint "$FINGERPRINT" \
@@ -198,8 +360,6 @@ write_state() {
 		--arg gtnh_java_variant "$GTNH_JAVA_VARIANT" \
 		--arg crucible_tag "$CRUCIBLE_TAG" \
 		--arg crucible_resolved "$CRUCIBLE_TAG_RESOLVED" \
-		--arg server_codename "$SERVER_CODENAME" \
-		--arg config_git_repo "$CONFIG_GIT_REPO" \
 		--arg server_dir "$SERVER_DIR" \
 		'{
             fingerprint: $fingerprint,
@@ -209,8 +369,6 @@ write_state() {
             gtnh_java_variant: $gtnh_java_variant,
             crucible_tag: $crucible_tag,
             crucible_tag_resolved: $crucible_resolved,
-            server_codename: $server_codename,
-            config_git_repo: $config_git_repo,
             server_dir: $server_dir
         }' >"$STATE_FILE"
 }
@@ -271,20 +429,21 @@ rm -f "$SERVER_DIR/$CRUCIBLE_JAR_STABLE"
 
 extract_zip_into() {
 	# Extract a zip into target dir. If the zip has a single top-level wrapper
-	# directory, descend into it transparently. -I ignores mtimes so layered
-	# extracts always overwrite earlier files.
+	# directory, descend into it transparently. cp -a preserves attributes
+	# and merges with whatever already exists in target.
 	local zip="$1" target="$2"
-	local tmp
+	local tmp src
 	tmp="$(mktemp -d)"
 	unzip -q -o "$zip" -d "$tmp"
 	shopt -s nullglob dotglob
 	local entries=("$tmp"/*)
 	shopt -u nullglob dotglob
 	if [ "${#entries[@]}" -eq 1 ] && [ -d "${entries[0]}" ]; then
-		rsync -aI "${entries[0]}/" "$target/"
+		src="${entries[0]}"
 	else
-		rsync -aI "$tmp/" "$target/"
+		src="$tmp"
 	fi
+	cp -a "$src/." "$target/"
 	rm -rf "$tmp"
 }
 
@@ -319,70 +478,10 @@ cp -f "$CRUCIBLE_JAR_PATH" "$SERVER_DIR/$CRUCIBLE_JAR_NAME"
 ln -sfn "$CRUCIBLE_JAR_NAME" "$SERVER_DIR/$CRUCIBLE_JAR_STABLE"
 
 # ----------------------------------------------------------------------------
-# Sync per-server configuration repo and overlay it
+# Apply config overlay AFTER the heavy install so it wins over pack defaults.
 # ----------------------------------------------------------------------------
 
-log "Syncing config repo branch '$SERVER_CODENAME' from $CONFIG_GIT_REPO"
-if [ -d "$CONFIG_REPO_DIR/.git" ]; then
-	git -C "$CONFIG_REPO_DIR" remote set-url origin "$CONFIG_GIT_REPO"
-	git -C "$CONFIG_REPO_DIR" fetch --depth=1 origin "$SERVER_CODENAME"
-	git -C "$CONFIG_REPO_DIR" reset --hard FETCH_HEAD
-	git -C "$CONFIG_REPO_DIR" clean -fdx
-else
-	rm -rf "$CONFIG_REPO_DIR"
-	git clone --depth=1 --branch "$SERVER_CODENAME" "$CONFIG_GIT_REPO" "$CONFIG_REPO_DIR"
-fi
-
-log "Overlaying configuration onto $SERVER_DIR"
-# *.template files are rendered by envsubst below; we don't want the raw
-# templates landing in the server tree, so exclude them from this rsync.
-# CONFIG_REPO_EXCLUDES holds developer-only paths that should never reach
-# the server.
-rsync_excludes=(--exclude='.git/' --exclude='*.template')
-for pattern in "${CONFIG_REPO_EXCLUDES[@]}"; do
-	rsync_excludes+=(--exclude="$pattern")
-done
-rsync -aI "${rsync_excludes[@]}" "$CONFIG_REPO_DIR/" "$SERVER_DIR/"
-
-# Render *.template files from the config repo, substituting only variables
-# defined in $SECRETS_ENV_FILE. Secrets are sourced in a subshell so they
-# never leak to the parent environment.
-templates=()
-while IFS= read -r -d '' tmpl; do
-	templates+=("$tmpl")
-done < <(find "$CONFIG_REPO_DIR" -type d -name '.git' -prune -o -type f -name '*.template' -print0)
-
-if [ "${#templates[@]}" -gt 0 ]; then
-	[ -f "$SECRETS_ENV_FILE" ] ||
-		die "config repo contains *.template files but $SECRETS_ENV_FILE does not exist"
-
-	# Names of variables actually defined in secrets.env. Restricting envsubst
-	# to this set prevents stray $PATH / $HOME-style strings in configs from
-	# being clobbered.
-	secret_var_names="$(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=.*/\2/p' "$SECRETS_ENV_FILE")"
-	[ -n "$secret_var_names" ] ||
-		die "$SECRETS_ENV_FILE contains no KEY=value entries — nothing to substitute"
-	# shellcheck disable=SC2086
-	envsubst_arg="$(printf '$%s ' $secret_var_names)"
-
-	log "Rendering ${#templates[@]} template file(s) using $SECRETS_ENV_FILE"
-	(
-		set -a
-		# shellcheck source=/dev/null
-		. "$SECRETS_ENV_FILE"
-		set +a
-		for tmpl in "${templates[@]}"; do
-			rel="${tmpl#"$CONFIG_REPO_DIR/"}"
-			out="$SERVER_DIR/${rel%.template}"
-			mkdir -p "$(dirname "$out")"
-			envsubst "$envsubst_arg" <"$tmpl" >"$out"
-			log "  rendered ${rel%.template}"
-		done
-	)
-fi
-
-# Make any shell scripts that came from the config repo executable.
-find "$SERVER_DIR" -maxdepth 2 -type f -name '*.sh' -exec chmod +x {} +
+apply_config_overlay
 
 # ----------------------------------------------------------------------------
 # Done
