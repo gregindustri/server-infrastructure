@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Ortan Fields
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+
+# dist/
+.install-cache/
+.install-config-repo/
+server/
