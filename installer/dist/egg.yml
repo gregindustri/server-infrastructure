@@ -495,10 +495,25 @@ scripts:
       	# Extract a zip into target dir. If the zip has a single top-level wrapper
       	# directory, descend into it transparently. cp -a preserves attributes
       	# and merges with whatever already exists in target.
+      	#
+      	# unzip's stdio is detached from the inherited pty: large packs (thousands
+      	# of small files) produce enough per-file output to fill Pelican's ~4KB
+      	# install-pty buffer, and if Wings's log consumer ever stalls (websocket
+      	# blip, etc) unzip blocks forever on write(). Redirecting to a log file
+      	# isolates us from that. On failure the log is dumped to stderr so the
+      	# panel install log still gets the diagnostics.
       	local zip="$1" target="$2"
-      	local tmp src
+      	local tmp src log
       	tmp="$(mktemp -d)"
-      	unzip -q -o "$zip" -d "$tmp"
+      	log="$(mktemp)"
+      	if ! unzip -o "$zip" -d "$tmp" </dev/null >"$log" 2>&1; then
+      		warn "unzip failed extracting $(basename "$zip"); last 40 lines of output:"
+      		tail -n 40 "$log" >&2
+      		rm -f "$log"
+      		rm -rf "$tmp"
+      		die "unzip failure"
+      	fi
+      	rm -f "$log"
       	shopt -s nullglob dotglob
       	local entries=("$tmp"/*)
       	shopt -u nullglob dotglob
