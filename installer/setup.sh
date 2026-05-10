@@ -429,8 +429,14 @@ rm -f "$SERVER_DIR/$CRUCIBLE_JAR_STABLE"
 
 extract_zip_into() {
 	# Extract a zip into target dir. If the zip has a single top-level wrapper
-	# directory, descend into it transparently. cp -a preserves attributes
-	# and merges with whatever already exists in target.
+	# directory, descend into it transparently.
+	#
+	# Both the temp extraction dir and the unzip log live UNDER $target, on
+	# the persistent volume — Pelican's install container writable layer
+	# (where /tmp lives) can be much smaller than the user-allocated server
+	# disk, and the GTNH pack is several gigabytes. Once extracted, we merge
+	# into $target with cp -alf — hardlinks instead of copies, which is
+	# essentially free on the same filesystem and uses no additional disk.
 	#
 	# unzip's stdio is detached from the inherited pty: large packs (thousands
 	# of small files) produce enough per-file output to fill Pelican's ~4KB
@@ -440,8 +446,9 @@ extract_zip_into() {
 	# panel install log still gets the diagnostics.
 	local zip="$1" target="$2"
 	local tmp src log
-	tmp="$(mktemp -d)"
-	log="$(mktemp)"
+	mkdir -p "$target"
+	tmp="$(mktemp -d -p "$target" .extract-tmp.XXXXXX)"
+	log="$(mktemp -p "$target" .extract-log.XXXXXX)"
 	if ! unzip -o "$zip" -d "$tmp" </dev/null >"$log" 2>&1; then
 		warn "unzip failed extracting $(basename "$zip"); last 40 lines of output:"
 		tail -n 40 "$log" >&2
@@ -458,7 +465,7 @@ extract_zip_into() {
 	else
 		src="$tmp"
 	fi
-	cp -a "$src/." "$target/"
+	cp -alf "$src/." "$target/"
 	rm -rf "$tmp"
 }
 
